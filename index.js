@@ -1,92 +1,212 @@
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
-
+ 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
+ 
 app.use(cors());
 app.use(express.json());
-
+ 
+// ─── CONSTANTES ───────────────────────────────────────────────────────────────
+const ACT_BASE = "https://profile.callofduty.com";
+const ACT_API  = "https://my.callofduty.com/api/papi-client";
+ 
+const BASE_HEADERS = {
+  "Content-Type": "application/json",
+  "Accept": "application/json",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+};
+ 
 // ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status: "CODM Tracker Backend is running 🎮" });
+  res.json({ status: "✅ CODM Tracker Backend is running 🎮" });
 });
-
-// ─── GET STATS BY ACTIVISION ID ───────────────────────────────────────────────
-// Example: GET /stats/GhostSniper%231234567
-app.get("/stats/:activisionId", async (req, res) => {
-  const { activisionId } = req.params;
-
+ 
+// ─── LOGIN ACTIVISION (email + mot de passe) ──────────────────────────────────
+app.post("/auth/activision", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ success: false, message: "Email et mot de passe requis" });
+  }
   try {
-    // Decode the Activision ID (e.g. GhostSniper#1234567)
-    const decoded = decodeURIComponent(activisionId);
-
-    // Call the unofficial COD stats API
-    const response = await axios.get(
-      `https://call-of-duty-modern-warfare.p.rapidapi.com/warzone/${encodeURIComponent(decoded)}/mp`,
+    const csrfRes = await axios.get(`${ACT_BASE}/do_login?new_SiteId=cod`, {
+      headers: BASE_HEADERS,
+    });
+    const csrfToken = csrfRes.headers["x-xsrf-token"] || "";
+    const cookies = (csrfRes.headers["set-cookie"] || []).join("; ");
+ 
+    const loginRes = await axios.post(
+      `${ACT_BASE}/do_login?new_SiteId=cod`,
+      new URLSearchParams({
+        username: email,
+        password: password,
+        remember_me: "true",
+        _csrf: csrfToken,
+      }).toString(),
       {
         headers: {
-          "X-RapidAPI-Key": process.env.RAPIDAPI_KEY,
-          "X-RapidAPI-Host": "call-of-duty-modern-warfare.p.rapidapi.com",
+          ...BASE_HEADERS,
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Cookie": cookies,
+          "X-XSRF-TOKEN": csrfToken,
+          "Referer": `${ACT_BASE}/do_login?new_SiteId=cod`,
+        },
+        maxRedirects: 0,
+        validateStatus: (s) => s < 400,
+      }
+    );
+ 
+    const sessionCookies = (loginRes.headers["set-cookie"] || []).join("; ");
+    if (!sessionCookies.includes("ACT_SSO_COOKIE")) {
+      return res.status(401).json({ success: false, message: "Identifiants incorrects" });
+    }
+ 
+    res.json({ success: true, cookies: sessionCookies });
+  } catch (err) {
+    console.error("Auth error:", err.message);
+    res.status(500).json({ success: false, message: "Erreur de connexion Activision" });
+  }
+});
+ 
+// ─── LOGIN FACEBOOK → ACTIVISION ─────────────────────────────────────────────
+app.post("/auth/facebook", async (req, res) => {
+  const { accessToken } = req.body;
+  if (!accessToken) {
+    return res.status(400).json({ success: false, message: "Token Facebook requis" });
+  }
+  try {
+    const fbRes = await axios.post(
+      `${ACT_BASE}/api/auth/identityProvider/token`,
+      { provider: "facebook", token: accessToken },
+      { headers: BASE_HEADERS, maxRedirects: 0, validateStatus: (s) => s < 400 }
+    );
+ 
+    const sessionCookies = (fbRes.headers["set-cookie"] || []).join("; ");
+    if (!sessionCookies.includes("ACT_SSO_COOKIE")) {
+      return res.status(401).json({ success: false, message: "Token Facebook invalide ou compte non lié à Activision" });
+    }
+ 
+    res.json({ success: true, cookies: sessionCookies });
+  } catch (err) {
+    console.error("Facebook auth error:", err.message);
+    res.status(500).json({ success: false, message: "Erreur d'authentification Facebook" });
+  }
+});
+ 
+// ─── STATS COD MOBILE ─────────────────────────────────────────────────────────
+// POST /stats  { cookies, activisionId }
+app.post("/stats", async (req, res) => {
+  const { cookies, activisionId } = req.body;
+  if (!cookies || !activisionId) {
+    return res.status(400).json({ success: false, message: "Cookies et activisionId requis" });
+  }
+  try {
+    const encoded = encodeURIComponent(activisionId);
+ 
+    // ✅ Endpoint spécifique COD Mobile
+    const statsRes = await axios.get(
+      `${ACT_API}/crm/cod/v2/title/mobile/platform/uno/gamer/${encoded}/profile/type/mp`,
+      {
+        headers: {
+          ...BASE_HEADERS,
+          "Cookie": cookies,
+          "X-XSRF-TOKEN": extractCookie(cookies, "XSRF-TOKEN"),
+          "ACT_SSO_COOKIE": extractCookie(cookies, "ACT_SSO_COOKIE"),
         },
       }
     );
-
-    const data = response.data;
-
-    // Format the response for our app
+ 
+    const data    = statsRes.data?.data?.lifetime?.all?.properties || {};
+    const ranked  = statsRes.data?.data?.lifetime?.mode?.ranked?.properties || {};
+    const br      = statsRes.data?.data?.lifetime?.mode?.br?.properties || {};
+    const mp      = statsRes.data?.data?.lifetime?.mode?.mp?.properties || {};
+ 
     const stats = {
-      username: decoded,
-      level: data.level || 0,
-      kd: data.lifetime?.all?.properties?.kdRatio?.toFixed(2) || "0.00",
-      wins: data.lifetime?.all?.properties?.wins || 0,
-      kills: data.lifetime?.all?.properties?.kills || 0,
-      deaths: data.lifetime?.all?.properties?.deaths || 0,
-      winRate: (
-        ((data.lifetime?.all?.properties?.wins || 0) /
-          (data.lifetime?.all?.properties?.gamesPlayed || 1)) *
-        100
-      ).toFixed(1),
-      gamesPlayed: data.lifetime?.all?.properties?.gamesPlayed || 0,
-      avgKills: data.lifetime?.all?.properties?.killsPerGame?.toFixed(1) || "0.0",
-      headshots: data.lifetime?.all?.properties?.headshots || 0,
-      accuracy: (
-        (data.lifetime?.all?.properties?.accuracy || 0) * 100
-      ).toFixed(1),
+      username: activisionId,
+      level: statsRes.data?.data?.level || 0,
+ 
+      // ── Stats globales ──
+      kd:               (data.kdRatio || 0).toFixed(2),
+      kills:            data.kills || 0,
+      deaths:           data.deaths || 0,
+      wins:             data.wins || 0,
+      gamesPlayed:      data.gamesPlayed || 0,
+      winRate:          (((data.wins || 0) / (data.gamesPlayed || 1)) * 100).toFixed(1),
+      avgKills:         (data.killsPerGame || 0).toFixed(1),
+      headshots:        data.headshots || 0,
+      accuracy:         ((data.accuracy || 0) * 100).toFixed(1),
+      scorePerGame:     Math.round(data.scorePerGame || 0),
+      longestStreak:    data.longestKillStreak || 0,
+ 
+      // ── Battle Royale ──
+      br: {
+        kd:          (br.kdRatio || 0).toFixed(2),
+        wins:        br.wins || 0,
+        gamesPlayed: br.gamesPlayed || 0,
+        top10:       br.topTen || 0,
+        avgKills:    (br.killsPerGame || 0).toFixed(1),
+        winRate:     (((br.wins || 0) / (br.gamesPlayed || 1)) * 100).toFixed(1),
+      },
+ 
+      // ── Multijoueur ──
+      mp: {
+        kd:          (mp.kdRatio || 0).toFixed(2),
+        wins:        mp.wins || 0,
+        gamesPlayed: mp.gamesPlayed || 0,
+        winRate:     (((mp.wins || 0) / (mp.gamesPlayed || 1)) * 100).toFixed(1),
+        scorePerGame: Math.round(mp.scorePerGame || 0),
+      },
+ 
+      // ── Ranked ──
+      ranked: {
+        kd:          (ranked.kdRatio || 0).toFixed(2),
+        wins:        ranked.wins || 0,
+        gamesPlayed: ranked.gamesPlayed || 0,
+        winRate:     (((ranked.wins || 0) / (ranked.gamesPlayed || 1)) * 100).toFixed(1),
+      },
     };
-
+ 
     res.json({ success: true, stats });
-  } catch (error) {
-    console.error("Error fetching stats:", error.message);
-
-    // If API fails, return mock data so the app still works
+  } catch (err) {
+    console.error("Stats error:", err.message);
     res.json({
       success: false,
-      message: "Stats temporairement indisponibles",
-      stats: getMockStats(decodeURIComponent(activisionId)),
+      message: "Stats temporairement indisponibles — données demo affichées",
+      stats: getMockStats(activisionId),
     });
   }
 });
-
-// ─── MOCK STATS FALLBACK ──────────────────────────────────────────────────────
+ 
+// ─── UTILITAIRES ──────────────────────────────────────────────────────────────
+function extractCookie(cookieStr, name) {
+  const match = cookieStr.match(new RegExp(`${name}=([^;]+)`));
+  return match ? match[1] : "";
+}
+ 
 function getMockStats(username) {
   return {
     username,
     level: 87,
     kd: "4.20",
-    wins: 46,
     kills: 12840,
     deaths: 3057,
-    winRate: "12.0",
+    wins: 46,
     gamesPlayed: 847,
+    winRate: "12.0",
     avgKills: "5.8",
     headshots: 3210,
     accuracy: "28.4",
+    scorePerGame: 4200,
+    longestStreak: 24,
+    br:     { kd: "4.20", wins: 46, gamesPlayed: 382, top10: 260, avgKills: "5.8", winRate: "12.0" },
+    mp:     { kd: "3.80", wins: 174, gamesPlayed: 284, winRate: "61.0", scorePerGame: 4200 },
+    ranked: { kd: "3.80", wins: 34, gamesPlayed: 63, winRate: "54.0" },
   };
 }
-
-// ─── START SERVER ─────────────────────────────────────────────────────────────
+ 
+// ─── START ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`✅ CODM Tracker Backend running on port ${PORT}`);
+  console.log(`✅ CODM Tracker Backend en ligne sur le port ${PORT}`);
 });
+ 
